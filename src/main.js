@@ -10,29 +10,52 @@ let currentSort = "id";
 let pokemonGrid, searchInput, suggestionsList, pagination;
 let showFavoritesOnly = false;
 
+const POKEAPI_BASE = 'https://pokeapi.co/api/v2/pokemon';
+const CACHE_VERSION = 'v1';
+
 async function fetchAllPokemon() {
-  let savedPokemon = localStorage.getItem("pokemonData");
-  if (savedPokemon) {
-    return JSON.parse(savedPokemon);
+  // Caché local
+  const cacheKey = `pokemonData_${CACHE_VERSION}`;
+  const cachedData = localStorage.getItem(cacheKey);
+
+  if (cachedData) {
+    return JSON.parse(cachedData);
   }
 
+  // Fetch por lotes
+  const batchSize = 10;
+  const totalBatches = Math.ceil(total / batchSize);
   let pokemonList = [];
-  for (let id = 1; id <= total; id++) {
-    const pokemon = await fetchPokemon(id);
-    if (pokemon) pokemonList.push(pokemon);
+
+  for (let batch = 0; batch < totalBatches; batch++) {
+    const startId = batch * batchSize + 1;
+    const endId = Math.min((batch + 1) * batchSize, total);
+
+    const batchRequests = Array.from({length: endId - startId + 1}, (_, i) => 
+      fetch(`${POKEAPI_BASE}/${startId + i}`).then(res => res.json())
+    );
+
+    const batchResults = await Promise.allSettled(batchRequests);
+    const successfulPokemon = batchResults
+      .filter(result => result.status === 'fulfilled')
+      .map(result => result.value);
+
+    pokemonList = [...pokemonList, ...successfulPokemon];
   }
 
-  const pokemonToStore = pokemonList.map((p) => ({
+  // Caché
+  const simplifiedData = pokemonList.map(p => ({
     id: p.id,
     name: p.name,
     types: p.types,
     stats: p.stats,
     height: p.height,
     weight: p.weight,
+    sprites: { front_default: p.sprites.front_default }
   }));
 
-  localStorage.setItem("pokemonData", JSON.stringify(pokemonToStore));
-  return pokemonList;
+  localStorage.setItem(cacheKey, JSON.stringify(simplifiedData));
+  return simplifiedData;
 }
 
 async function fetchPokemon(id) {
@@ -47,11 +70,22 @@ async function fetchPokemon(id) {
 
 async function getPokemonSprite(id) {
   try {
-    const response = await fetch(`https://pokeapi.co/api/v2/pokemon/${id}`);
+    // Verificar datos
+    const savedPokemon = JSON.parse(localStorage.getItem(`pokemonData_${CACHE_VERSION}`));
+    const cachedPokemon = savedPokemon?.find(p => p.id === id);
+
+    if (cachedPokemon?.sprites?.front_default) {
+      return cachedPokemon.sprites.front_default;
+    }
+
+    // Si no caché, hacer fetch
+    const response = await fetch(`${POKEAPI_BASE}/${id}`);
     const data = await response.json();
     return data.sprites.front_default;
+
   } catch (error) {
-    return "fallback-sprite.png";
+    console.error(`Error fetching sprite for Pokémon #${id}:`, error);
+    return 'fallback-sprite.png';
   }
 }
 
@@ -368,11 +402,21 @@ async function init() {
     suggestionsList = document.getElementById("suggestions");
     pagination = document.querySelector(".pagination");
 
+    // Loading
+    pokemonGrid.innerHTML = `
+      <div class="pokemon-grid-loading">
+        <div class="text-center">
+          <div class="pokemon-loading-spinner"></div>
+          <p class="loading-text">Cargando Pokédex...</p>
+        </div>
+      </div>`;
+
     if (!pokemonGrid || !searchInput || !suggestionsList || !pagination) {
       throw new Error("Elementos del DOM no encontrados");
     }
 
-    // event listeners
+    // Event listeners
+    // Botón favoritos
     document.addEventListener('click', (e) => {
       const favoriteBtn = e.target.closest('.btn-favorite');
       if (favoriteBtn) {
@@ -380,6 +424,7 @@ async function init() {
       }
     });
 
+    // Filtros
     const typeFilters = document.getElementById("type-filters");
     const collapseInstance = new bootstrap.Collapse(typeFilters, { 
       toggle: false
@@ -391,30 +436,23 @@ async function init() {
       updateFilterArrow();
     });
 
-    document.addEventListener("click", (e) => {
-      if (!e.target.closest(".filter-container")) {
-        collapseInstance.hide();
-        updateFilterArrow();
-      }
-    });
-
     function updateFilterArrow() {
       const arrow = document.getElementById("toggle-type-filter");
       if (arrow) {
-        arrow.innerHTML = typeFilters.classList.contains("show") 
-          ? "Filtrar por tipo ▲" 
+        arrow.innerHTML = typeFilters.classList.contains("show")
+          ? "Filtrar por tipo ▲"
           : "Filtrar por tipo ▼";
       }
     }
 
-    // Configurar toggle de favoritos
+    // Toggle de favoritos
     document.getElementById("favorites-toggle").addEventListener("click", () => {
       showFavoritesOnly = !showFavoritesOnly;
       applyFilters(true);
       Favorites.updateFavoritesIcon();
     });
 
-    // Cargar Pokémon
+    // Cargar pokémons
     allPokemon = await fetchAllPokemon();
 
     if (!Array.isArray(allPokemon)) {
@@ -422,34 +460,30 @@ async function init() {
       allPokemon = await fetchAllPokemon();
     }
 
-    // Filtros de tipo
+    // Components
     const uniqueTypes = getAllUniqueTypes(allPokemon);
     renderTypeFilters(uniqueTypes);
-
-    // Ordenamiento
     setupSorting();
-
-    // Configurar búsqueda y paginación
     setupSearch();
     setupPagination();
 
-    // Renderizar grid inicial
-    renderPokemonGrid(allPokemon, 1);
+    // Render grid
+    await renderPokemonGrid(allPokemon, 1);
 
-    // Actualizar iconos de favoritos
+    // Actualizar favoritos
     Favorites.updateFavoritesIcon();
     Favorites.updateAllFavoriteIcons();
 
   } catch (error) {
     console.error("Error en init:", error);
-    if (pokemonGrid) {
-      pokemonGrid.innerHTML = `
-        <div class="col-12 text-center text-danger py-5">
-          <h3>Error al cargar los Pokémon</h3>
-          <p>${error.message}</p>
-          <button class="btn btn-primary mt-3" onclick="location.reload()">Reintentar</button>
-        </div>`;
-    }
+    pokemonGrid.innerHTML = `
+      <div class="col-12 text-center py-5">
+        <h4 class="text-danger">Error al cargar los Pokémon</h4>
+        <p>${error.message}</p>
+        <button class="btn btn-outline-danger mt-3" onclick="location.reload()">
+          <i class="bi bi-arrow-clockwise"></i> Reintentar
+        </button>
+      </div>`;
   }
 }
 
